@@ -1,35 +1,58 @@
 import os, re, ssl, asyncio, asyncpg, httpx
 from fastapi import FastAPI, Request
 
-# ===== settings =====
-BOT_TOKEN    = os.environ["BOT_TOKEN"]          # e.g. 123456:ABC...
-DATABASE_URL = os.environ["DATABASE_URL"]       # include ?sslmode=require for Supabase
+# =========================
+# Settings / Environment
+# =========================
+BOT_TOKEN    = os.environ["BOT_TOKEN"]                    # e.g. 123456:ABC...
+DATABASE_URL = os.environ["DATABASE_URL"]                 # include ?sslmode=require if using Supabase
 ALLOWED_IDS  = set(int(x) for x in os.getenv("ALLOWED_TELEGRAM_IDS","").split(",") if x.strip())
 
-# Public URL of this service for webhook (Render sets RENDER_EXTERNAL_URL)
-PUBLIC_URL   = os.getenv("PUBLIC_URL") or os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
+# TLS controls for DB (use defaults for safety; flip DB_SSL_VERIFY=0 only if your DB uses self-signed CA)
+DB_SSL_VERIFY = os.getenv("DB_SSL_VERIFY", "1")           # "1" = verify certs (recommended), "0" = disable verification
+DB_SSL_MODE   = os.getenv("DB_SSL_MODE", "require")       # "require" | "disable"
+
+# Public URL for webhook; Render provides RENDER_EXTERNAL_URL at runtime
+PUBLIC_URL   = os.getenv("PUBLIC_URL") or os.getenv("RENDER_EXTERNAL_URL", "")
+PUBLIC_URL   = PUBLIC_URL.rstrip("/")
 WEBHOOK_PATH = "/telegram/webhook"
 WEBHOOK_URL  = (PUBLIC_URL + WEBHOOK_PATH) if PUBLIC_URL else None
 
-# Optional shared secret so only Telegram can call our webhook
+# Optional secret to ensure only Telegram hits the webhook
 WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "")
 
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-# ===== app + db pool =====
+# =========================
+# App + DB Pool
+# =========================
 app = FastAPI()
 _pool: asyncpg.Pool | None = None
 
 def _ssl_ctx():
-    # Supabase requires TLS
+    if DB_SSL_MODE.lower() == "disable":
+        return None  # no TLS (not recommended)
     ctx = ssl.create_default_context()
+    if DB_SSL_VERIFY == "0":
+        # TEMPORARY: accept self-signed / unknown CAs
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
     return ctx
 
 async def _create_pool(dsn: str, retries: int = 6, delay: float = 1.0):
     last = None
     for _ in range(retries):
         try:
-            return await asyncpg.create_pool(dsn=dsn, min_size=1, max_size=4, ssl=_ssl_ctx(), command_timeout=30)
+            # ensure sslmode present
+            if "sslmode=" not in dsn:
+                dsn = dsn + (("&" if "?" in dsn else "?") + f"sslmode={DB_SSL_MODE}")
+            return await asyncpg.create_pool(
+                dsn=dsn,
+                min_size=1,
+                max_size=4,
+                ssl=_ssl_ctx(),
+                command_timeout=30,
+            )
         except Exception as e:
             last = e
             await asyncio.sleep(delay)
@@ -39,36 +62,36 @@ async def _create_pool(dsn: str, retries: int = 6, delay: float = 1.0):
 @app.on_event("startup")
 async def startup():
     global _pool
-    dsn = DATABASE_URL
-    if "sslmode=" not in dsn:
-        dsn += ("&" if "?" in dsn else "?") + "sslmode=require"
-    _pool = await _create_pool(dsn)
+    _pool = await _create_pool(DATABASE_URL)
 
 async def db_fetch(sql: str, *params):
     async with _pool.acquire() as conn:
         return await conn.fetch(sql, *params)
 
-# ===== helpers =====
+# =========================
+# Helpers
+# =========================
 PAGE_SIZE = 5
 
 def rupiah(x: int | float) -> str:
     return "Rp" + format(int(x), ",").replace(",", ".")
 
 def mdv2_escape(s: str) -> str:
-    # Escape Telegram MarkdownV2 reserved chars (do NOT use for URLs)
+    # Escape Telegram MarkdownV2 reserved characters
     return re.sub(r'([_*\[\]()~`>#+\-=|{}.!])', r'\\\1', s or "")
 
-# Telegram call with logging
+# Telegram API call with logging
 async def _tg(method: str, payload: dict):
-    async with httpx.AsyncClient(timeout=15) as c:
+    async with httpx.AsyncClient(timeout=20) as c:
         r = await c.post(f"{TG_API}/{method}", json=payload)
-        ok = False
         try:
             data = r.json()
             ok = bool(data.get("ok"))
         except Exception:
             data = {"raw": r.text}
+            ok = False
         if not ok:
+            # Visible in Render logs
             print("Telegram error:", method, r.status_code, data)
         return ok, data
 
@@ -98,7 +121,7 @@ async def answer_callback(callback_query_id: str):
     await _tg("answerCallbackQuery", {"callback_query_id": callback_query_id})
 
 async def send_long_text(chat_id: int, text: str, parse_mode: str | None = None):
-    MAX = 4000  # under ~4096 cap
+    MAX = 4000  # safety under ~4096 cap
     while text:
         cut = text.rfind("\n", 0, MAX)
         if cut == -1 or cut < MAX * 0.6:
@@ -106,7 +129,9 @@ async def send_long_text(chat_id: int, text: str, parse_mode: str | None = None)
         chunk, text = text[:cut], text[cut:]
         await send(chat_id, chunk, parse_mode=parse_mode)
 
-# ===== SQL =====
+# =========================
+# SQL
+# =========================
 SQL_LIST_PRODUCTS = """
 select id,
        "nama"            as name,
@@ -139,7 +164,7 @@ select id,
        "Fungsi"        as function,
        "Deskripsi"     as description,
        "Indikasi"      as indications,
-       "Aturan pakai"  as dosage,           -- fixed column label (was 'Aturan paka')
+       "Aturan pakai"  as dosage,
        "URL"           as url,
        "Image URL"     as image_url
 from "DataObat"
@@ -168,6 +193,9 @@ order by "nama", "kemasan"
 limit 5;
 """
 
+# =========================
+# Data Access Helpers
+# =========================
 async def find_prices(qname: str, qpack: str = "", threshold: float = 0.30):
     qname = (qname or "").strip()
     qpack = (qpack or "").strip()
@@ -181,18 +209,21 @@ async def find_prices(qname: str, qpack: str = "", threshold: float = 0.30):
         rows = [dict(r) for r in await db_fetch(SQL_LOOKUP_SUBSTRING, qname, qpack)]
     return rows
 
-# ===== Catalog + detail =====
 async def list_products(q: str = "", category: str = "", page: int = 1, page_size: int = PAGE_SIZE):
     total = (await db_fetch(SQL_COUNT_PRODUCTS, q, category))[0]["cnt"]
     offset = (page - 1) * page_size
     rows = [dict(r) for r in await db_fetch(SQL_LIST_PRODUCTS, q, category, page_size, offset)]
     return total, rows
 
+# =========================
+# Catalog / Detail Senders
+# =========================
 async def send_catalog(chat_id: int, q: str = "", category: str = "", page: int = 1):
     total, rows = await list_products(q, category, page)
     if not rows:
         await send(chat_id, "Tidak ada produk untuk filter tersebut.")
         return
+
     start = (page - 1) * PAGE_SIZE + 1
     lines = [f"{i}. {r['name']} — {r['pack']} — {rupiah(r['price'])}"
              for i, r in enumerate(rows, start=start)]
@@ -249,7 +280,7 @@ async def send_product_detail(chat_id: int, pid: int):
         return
     r = dict(rows[0])
 
-    # title and subtitle in MarkdownV2
+    # title and subtitle in MarkdownV2 (do not put URL inside MarkdownV2 link text)
     title = f"*{mdv2_escape(r['name'])}*"
     bits = []
     if r.get("pack"):        bits.append(mdv2_escape(r["pack"]))
@@ -260,10 +291,9 @@ async def send_product_detail(chat_id: int, pid: int):
     if subtitle: caption_lines.append(subtitle)
     caption_lines.append(f"Harga: *{mdv2_escape(rupiah(r['price']))}*")
     if r.get("sku"): caption_lines.append(f"SKU: {mdv2_escape(r['sku'])}")
-    # Do NOT put the URL inside MarkdownV2 link text to avoid escaping problems
     caption = "\n".join(caption_lines)
 
-    # Long text body
+    # long body
     details = []
     for label, key in [("Fungsi","function"), ("Deskripsi","description"),
                        ("Indikasi","indications"), ("Aturan pakai","dosage")]:
@@ -279,24 +309,40 @@ async def send_product_detail(chat_id: int, pid: int):
             await send_long_text(chat_id, long_text, parse_mode="MarkdownV2")
     else:
         text = caption + ("\n\n"+long_text if long_text else "")
-        # If there is a URL but no image, send a message with a URL button
         if url_buttons:
             await send_with_keyboard(chat_id, text, url_buttons, parse_mode="MarkdownV2")
         else:
             await send_long_text(chat_id, text, parse_mode="MarkdownV2")
 
-# ===== Webhook endpoints =====
-
+# =========================
+# HTTP Endpoints
+# =========================
 @app.get("/")
 def health():
     return {"ok": True}
+
+@app.get("/dbz")
+async def db_ping():
+    async with _pool.acquire() as conn:
+        v = await conn.fetchval("select 1")
+    return {"db": v}
+
+@app.get("/set-webhook")
+async def set_webhook():
+    if not WEBHOOK_URL:
+        return {"ok": False, "error": "PUBLIC_URL or RENDER_EXTERNAL_URL not set"}
+    payload = {"url": WEBHOOK_URL}
+    if WEBHOOK_SECRET:
+        payload["secret_token"] = WEBHOOK_SECRET
+    ok, data = await _tg("setWebhook", payload)
+    return {"ok": ok, "telegram": data, "url": WEBHOOK_URL}
 
 @app.post(WEBHOOK_PATH)
 async def telegram_webhook(request: Request):
     # Optional signature check
     if WEBHOOK_SECRET:
         if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != WEBHOOK_SECRET:
-            # Silently ignore if secret mismatch
+            # ignore silently
             return {"ok": True}
 
     update = await request.json()
@@ -326,6 +372,7 @@ async def telegram_webhook(request: Request):
     if not chat_id or not text:
         return {"ok": True}
 
+    # simple RBAC
     if ALLOWED_IDS and uid not in ALLOWED_IDS:
         await send(chat_id, "Access restricted. Ask admin to allow your Telegram ID.")
         return {"ok": True}
@@ -380,14 +427,3 @@ async def telegram_webhook(request: Request):
         "Contoh: /produk vita kategori Peternakan page 2"
     )
     return {"ok": True}
-
-# Convenience endpoint to set webhook from the server
-@app.get("/set-webhook")
-async def set_webhook():
-    if not WEBHOOK_URL:
-        return {"ok": False, "error": "PUBLIC_URL or RENDER_EXTERNAL_URL not set"}
-    payload = {"url": WEBHOOK_URL}
-    if WEBHOOK_SECRET:
-        payload["secret_token"] = WEBHOOK_SECRET
-    ok, data = await _tg("setWebhook", payload)
-    return {"ok": ok, "telegram": data}
