@@ -1,14 +1,14 @@
-import os, re, ssl, asyncio, asyncpg, httpx
+import os, re, ssl, asyncio, asyncpg, httpx, certifi
 from fastapi import FastAPI, Request
 
 # =========================
 # Settings / Environment
 # =========================
 BOT_TOKEN    = os.environ["BOT_TOKEN"]                    # e.g. 123456:ABC...
-DATABASE_URL = os.environ["DATABASE_URL"]                 # include ?sslmode=require if using Supabase
+DATABASE_URL = os.environ["DATABASE_URL"]                 # Supabase session pooler URL + ?sslmode=require
 ALLOWED_IDS  = set(int(x) for x in os.getenv("ALLOWED_TELEGRAM_IDS","").split(",") if x.strip())
 
-# TLS controls for DB
+# TLS controls for DB (keep defaults; only change if you really must)
 DB_SSL_VERIFY = os.getenv("DB_SSL_VERIFY", "1")           # "1" = verify certs (recommended), "0" = disable verification
 DB_SSL_MODE   = os.getenv("DB_SSL_MODE", "require")       # "require" | "disable"
 
@@ -31,10 +31,12 @@ _pool: asyncpg.Pool | None = None
 _http: httpx.AsyncClient | None = None
 
 def _ssl_ctx():
+    """Create SSL context that trusts public CAs (via certifi)."""
     if DB_SSL_MODE.lower() == "disable":
         return None  # no TLS (not recommended)
-    ctx = ssl.create_default_context()
+    ctx = ssl.create_default_context(cafile=certifi.where())
     if DB_SSL_VERIFY == "0":
+        # TEMPORARY: accept self-signed / unknown CAs
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
     return ctx
@@ -43,6 +45,7 @@ async def _create_pool(dsn: str, retries: int = 6, delay: float = 1.0):
     last = None
     for _ in range(retries):
         try:
+            # ensure sslmode present
             if "sslmode=" not in dsn:
                 dsn = dsn + (("&" if "?" in dsn else "?") + f"sslmode={DB_SSL_MODE}")
             return await asyncpg.create_pool(
@@ -62,8 +65,11 @@ async def _create_pool(dsn: str, retries: int = 6, delay: float = 1.0):
 async def startup():
     global _pool, _http
     _pool = await _create_pool(DATABASE_URL)
-    # single shared HTTP client (keep-alive) for Telegram to reduce connection setup latency
-    _http = httpx.AsyncClient(timeout=httpx.Timeout(10, connect=5, read=10), limits=httpx.Limits(max_keepalive_connections=10, max_connections=20))
+    # single shared HTTP client (keep-alive) for Telegram to reduce latency
+    _http = httpx.AsyncClient(
+        timeout=httpx.Timeout(10, connect=5, read=10),
+        limits=httpx.Limits(max_keepalive_connections=10, max_connections=20),
+    )
 
 @app.on_event("shutdown")
 async def shutdown():
@@ -298,7 +304,6 @@ async def send_product_detail(chat_id: int, pid: int):
             details.append(f"*{label}:*\n{mdv2_escape(str(r[key]))}")
     long_text = "\n\n".join(details)
 
-    # If URL exists, send button (no image)
     if r.get("url"):
         buttons = [[{"text": "Info produk", "url": r["url"]}]]
         await send_with_keyboard(chat_id, caption + ("\n\n"+long_text if long_text else ""), buttons, parse_mode="MarkdownV2")
