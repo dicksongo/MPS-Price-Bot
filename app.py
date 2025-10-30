@@ -8,13 +8,15 @@ BOT_TOKEN    = os.environ["BOT_TOKEN"]                    # e.g. 123456:ABC...
 DATABASE_URL = os.environ["DATABASE_URL"]                 # Supabase session pooler URL + ?sslmode=require
 ALLOWED_IDS  = set(int(x) for x in os.getenv("ALLOWED_TELEGRAM_IDS","").split(",") if x.strip())
 
-# TLS controls for DB (keep defaults; only change if you really must)
-DB_SSL_VERIFY = os.getenv("DB_SSL_VERIFY", "1")           # "1" = verify certs (recommended), "0" = disable verification
+# TLS controls for DB
+DB_SSL_VERIFY = os.getenv("DB_SSL_VERIFY", "1")           # "1" verify (recommended), "0" disable verification
 DB_SSL_MODE   = os.getenv("DB_SSL_MODE", "require")       # "require" | "disable"
 
+# Category used by /vaksin shortcut
+VACCINE_CATEGORY = os.getenv("VACCINE_CATEGORY", "vaccine")  # set to "Vaksin" if your data uses Indonesian
+
 # Public URL for webhook; Render provides RENDER_EXTERNAL_URL at runtime
-PUBLIC_URL   = os.getenv("PUBLIC_URL") or os.getenv("RENDER_EXTERNAL_URL", "")
-PUBLIC_URL   = PUBLIC_URL.rstrip("/")
+PUBLIC_URL   = (os.getenv("PUBLIC_URL") or os.getenv("RENDER_EXTERNAL_URL", "")).rstrip("/")
 WEBHOOK_PATH = "/telegram/webhook"
 WEBHOOK_URL  = (PUBLIC_URL + WEBHOOK_PATH) if PUBLIC_URL else None
 
@@ -33,10 +35,9 @@ _http: httpx.AsyncClient | None = None
 def _ssl_ctx():
     """Create SSL context that trusts public CAs (via certifi)."""
     if DB_SSL_MODE.lower() == "disable":
-        return None  # no TLS (not recommended)
+        return None
     ctx = ssl.create_default_context(cafile=certifi.where())
     if DB_SSL_VERIFY == "0":
-        # TEMPORARY: accept self-signed / unknown CAs
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
     return ctx
@@ -45,7 +46,6 @@ async def _create_pool(dsn: str, retries: int = 6, delay: float = 1.0):
     last = None
     for _ in range(retries):
         try:
-            # ensure sslmode present
             if "sslmode=" not in dsn:
                 dsn = dsn + (("&" if "?" in dsn else "?") + f"sslmode={DB_SSL_MODE}")
             return await asyncpg.create_pool(
@@ -65,7 +65,6 @@ async def _create_pool(dsn: str, retries: int = 6, delay: float = 1.0):
 async def startup():
     global _pool, _http
     _pool = await _create_pool(DATABASE_URL)
-    # single shared HTTP client (keep-alive) for Telegram to reduce latency
     _http = httpx.AsyncClient(
         timeout=httpx.Timeout(10, connect=5, read=10),
         limits=httpx.Limits(max_keepalive_connections=10, max_connections=20),
@@ -90,10 +89,8 @@ def rupiah(x: int | float) -> str:
     return "Rp" + format(int(x), ",").replace(",", ".")
 
 def mdv2_escape(s: str) -> str:
-    # Escape Telegram MarkdownV2 reserved characters
     return re.sub(r'([_*\[\]()~`>#+\-=|{}.!])', r'\\\1', s or "")
 
-# Telegram API call with logging (uses shared client)
 async def _tg(method: str, payload: dict):
     r = await _http.post(f"{TG_API}/{method}", json=payload)
     try:
@@ -213,10 +210,14 @@ async def find_prices(qname: str, qpack: str = "", threshold: float = 0.30):
     return rows
 
 async def list_products(q: str = "", category: str = "", page: int = 1, page_size: int = PAGE_SIZE):
-    total = (await db_fetch(SQL_COUNT_PRODUCTS, q, category))[0]["cnt"]
-    offset = (page - 1) * page_size
-    rows = [dict(r) for r in await db_fetch(SQL_LIST_PRODUCTS, q, category, page_size, offset)]
-    return total, rows
+    try:
+        total = (await db_fetch(SQL_COUNT_PRODUCTS, q, category))[0]["cnt"]
+        offset = (page - 1) * page_size
+        rows = [dict(r) for r in await db_fetch(SQL_LIST_PRODUCTS, q, category, page_size, offset)]
+        return total, rows
+    except Exception as e:
+        print("DB error list_products:", e)
+        return 0, []
 
 # =========================
 # Catalog / Detail Senders (text-only)
@@ -224,7 +225,10 @@ async def list_products(q: str = "", category: str = "", page: int = 1, page_siz
 async def send_catalog(chat_id: int, q: str = "", category: str = "", page: int = 1):
     total, rows = await list_products(q, category, page)
     if not rows:
-        await send(chat_id, "Tidak ada produk untuk filter tersebut.")
+        msg = "Tidak ada produk untuk filter tersebut."
+        if category:
+            msg += f" (kategori={category})"
+        await send(chat_id, msg)
         return
 
     start = (page - 1) * PAGE_SIZE + 1
@@ -277,14 +281,20 @@ async def edit_message_with_catalog(cb, page: int, q: str, category: str):
     await edit_message_text(chat_id, message_id, body, {"inline_keyboard": buttons})
 
 async def send_product_detail(chat_id: int, pid: int):
-    rows = await db_fetch(SQL_PRODUCT_DETAIL, pid)
+    try:
+        rows = await db_fetch(SQL_PRODUCT_DETAIL, pid)
+    except Exception as e:
+        print("DB error product_detail:", e)
+        await send(chat_id, "Terjadi kesalahan saat mengambil detail produk.")
+        return
+
     if not rows:
         await send(chat_id, "Produk tidak ditemukan.")
         return
+
     r = dict(rows[0])
 
-    # MarkdownV2 caption (no images, no Markdown URL)
-    title = f"*{mdv2_escape(r['name'])}*"
+    title = f"*{mdv2_escape(r.get('name',''))}*"
     bits = []
     if r.get("pack"):        bits.append(mdv2_escape(r["pack"]))
     if r.get("category"):    bits.append(mdv2_escape(r["category"]))
@@ -292,11 +302,11 @@ async def send_product_detail(chat_id: int, pid: int):
     subtitle = "  •  ".join(bits)
     caption_lines = [title]
     if subtitle: caption_lines.append(subtitle)
-    caption_lines.append(f"Harga: *{mdv2_escape(rupiah(r['price']))}*")
+    if r.get("price") is not None:
+        caption_lines.append(f"Harga: *{mdv2_escape(rupiah(r['price']))}*")
     if r.get("sku"): caption_lines.append(f"SKU: {mdv2_escape(r['sku'])}")
     caption = "\n".join(caption_lines)
 
-    # long body
     details = []
     for label, key in [("Fungsi","function"), ("Deskripsi","description"),
                        ("Indikasi","indications"), ("Aturan pakai","dosage")]:
@@ -311,6 +321,44 @@ async def send_product_detail(chat_id: int, pid: int):
         await send_long_text(chat_id, caption + ("\n\n"+long_text if long_text else ""), parse_mode="MarkdownV2")
 
 # =========================
+# Parsing helpers
+# =========================
+def _extract_arg(pattern: str, text: str) -> str:
+    """Return the first group of pattern search or ''."""
+    m = re.search(pattern, text, flags=re.I)
+    return (m.group(1).strip() if m else "")
+
+def _parse_produk_args(args: str):
+    """
+    Supports:
+      /produk
+      /produk vita
+      /produk vita page 2
+      /produk vita kategori Peternakan
+      /produk kategori "Alat Kesehatan" page 3
+      (kategori and page can be in any order)
+    """
+    if not args:
+        return "", "", 1
+
+    # quoted kategori first
+    kat = _extract_arg(r'\bkategori\s+"([^"]+)"', args)
+    if not kat:
+        # unquoted, capture until end or before 'page <N>'
+        m = re.search(r'\bkategori\s+(.+?)(?=\s+page\s+\d+\b|$)', args, flags=re.I)
+        kat = (m.group(1).strip() if m else "")
+
+    page_txt = _extract_arg(r'\bpage\s+(\d+)\b', args)
+    page = max(1, int(page_txt)) if page_txt.isdigit() else 1
+
+    # remove recognised parts to get free-text q
+    q = re.sub(r'\bkategori\s+"[^"]+"\b', '', args, flags=re.I)
+    q = re.sub(r'\bkategori\s+(.+?)(?=\s+page\s+\d+\b|$)', '', q, flags=re.I)
+    q = re.sub(r'\bpage\s+\d+\b', '', q, flags=re.I).strip()
+
+    return q, kat, page
+
+# =========================
 # HTTP Endpoints
 # =========================
 @app.get("/")
@@ -319,9 +367,13 @@ def health():
 
 @app.get("/dbz")
 async def db_ping():
-    async with _pool.acquire() as conn:
-        v = await conn.fetchval("select 1")
-    return {"db": v}
+    try:
+        async with _pool.acquire() as conn:
+            v = await conn.fetchval("select 1")
+        return {"db": v}
+    except Exception as e:
+        print("DBZ error:", e)
+        return {"db": None, "error": str(e)}
 
 @app.get("/set-webhook")
 async def set_webhook():
@@ -339,85 +391,98 @@ async def telegram_webhook(request: Request):
     if WEBHOOK_SECRET and request.headers.get("X-Telegram-Bot-Api-Secret-Token") != WEBHOOK_SECRET:
         return {"ok": True}
 
-    update = await request.json()
-
-    # Callback queries
-    cb = update.get("callback_query")
-    if cb:
-        chat_id = cb["message"]["chat"]["id"]
-        data = cb.get("data") or ""
-        if data.startswith("page:"):
-            _, p, q, category = data.split(":", 3)
-            await edit_message_with_catalog(cb, int(p), q, category)
-        elif data.startswith("product:"):
-            _, pid = data.split(":", 1)
-            await send_product_detail(chat_id, int(pid))
-        await answer_callback(cb["id"])
+    try:
+        update = await request.json()
+    except Exception as e:
+        print("Bad JSON from Telegram:", e)
         return {"ok": True}
 
-    # Normal messages
-    msg  = update.get("message") or {}
-    chat = msg.get("chat") or {}
-    user = msg.get("from") or {}
-    chat_id = chat.get("id")
-    uid     = user.get("id")
-    text    = (msg.get("text") or "").strip()
-
-    if not chat_id or not text:
-        return {"ok": True}
-
-    # simple RBAC
-    if ALLOWED_IDS and uid not in ALLOWED_IDS:
-        await send(chat_id, "Access restricted. Ask admin to allow your Telegram ID.")
-        return {"ok": True}
-
-    # /produk [kata] [kategori X] [page N]
-    m = re.match(r"^/?produk(?:\s+(.*))?$", text, flags=re.I)
-    if m:
-        args = (m.group(1) or "").strip()
-        q = ""
-        category = ""
-        page = 1
-        if args:
-            mp = re.search(r"\bpage\s+(\d+)\b", args, flags=re.I)
-            if mp: page = max(1, int(mp.group(1)))
-            mc = re.search(r"\bkategori\s+(\S+)\b", args, flags=re.I)
-            if mc: category = mc.group(1)
-            q = re.sub(r"\b(page\s+\d+|kategori\s+\S+)\b", "", args, flags=re.I).strip()
-        await send_catalog(chat_id, q, category, page)
-        return {"ok": True}
-
-    # /vaksin [kata] [page N]  (Kategori = vaccine)
-    m = re.match(r"^/?vaksin(?:\s+(.*))?$", text, flags=re.I)
-    if m:
-        args = (m.group(1) or "").strip()
-        q = ""
-        page = 1
-        if args:
-            mp = re.search(r"\bpage\s+(\d+)\b", args, flags=re.I)
-            if mp: page = max(1, int(mp.group(1)))
-            q = re.sub(r"\bpage\s+\d+\b", "", args, flags=re.I).strip()
-        await send_catalog(chat_id, q, "vaccine", page)
-        return {"ok": True}
-
-    # /harga <nama> [pack <teks>]
-    m = re.match(r"^/?harga\s+(.+?)(?:\s+pack\s+(.+))?$", text, flags=re.I)
-    if m:
-        name, pack = m.group(1), (m.group(2) or "")
-        rows = await find_prices(name, pack)
-        if not rows:
-            await send(chat_id, "Tidak ditemukan. Coba nama lebih sederhana atau sertakan pack (mis. 100g / 250g / Box).")
+    try:
+        # Callback queries
+        cb = update.get("callback_query")
+        if cb:
+            chat_id = cb["message"]["chat"]["id"]
+            data = cb.get("data") or ""
+            if data.startswith("page:"):
+                _, p, q, category = data.split(":", 3)
+                await edit_message_with_catalog(cb, int(p), q, category)
+            elif data.startswith("product:"):
+                _, pid = data.split(":", 1)
+                await send_product_detail(chat_id, int(pid))
+            await answer_callback(cb["id"])
             return {"ok": True}
-        lines = [f"• {r['name']} — {r['pack']}: {rupiah(r['price'])}" for r in rows]
-        await send(chat_id, "\n".join(lines))
+
+        # Normal messages
+        msg  = update.get("message") or {}
+        chat = msg.get("chat") or {}
+        user = msg.get("from") or {}
+        chat_id = chat.get("id")
+        uid     = user.get("id")
+        text    = (msg.get("text") or "").strip()
+
+        if not chat_id or not text:
+            return {"ok": True}
+
+        # simple RBAC
+        if ALLOWED_IDS and uid not in ALLOWED_IDS:
+            await send(chat_id, "Access restricted. Ask admin to allow your Telegram ID.")
+            return {"ok": True}
+
+        # /ping
+        if re.match(r"^/?ping$", text, flags=re.I):
+            await send(chat_id, "pong")
+            return {"ok": True}
+
+        # /produk [kata] [kategori X] [page N]
+        m = re.match(r"^/?produk(?:\s+(.*))?$", text, flags=re.I)
+        if m:
+            args = (m.group(1) or "").strip()
+            q, category, page = _parse_produk_args(args)
+            await send_catalog(chat_id, q, category, page)
+            return {"ok": True}
+
+        # /vaksin [kata] [page N]  (Kategori = VACCINE_CATEGORY)
+        m = re.match(r"^/?vaksin(?:\s+(.*))?$", text, flags=re.I)
+        if m:
+            args = (m.group(1) or "").strip()
+            # only parse page from args; the free text is q
+            page_txt = _extract_arg(r'\bpage\s+(\d+)\b', args)
+            page = max(1, int(page_txt)) if page_txt.isdigit() else 1
+            q = re.sub(r'\bpage\s+\d+\b', '', args, flags=re.I).strip()
+            await send_catalog(chat_id, q, VACCINE_CATEGORY, page)
+            return {"ok": True}
+
+        # /harga <nama> [pack <teks>]
+        m = re.match(r"^/?harga\s+(.+?)(?:\s+pack\s+(.+))?$", text, flags=re.I)
+        if m:
+            name, pack = m.group(1), (m.group(2) or "")
+            rows = await find_prices(name, pack)
+            if not rows:
+                await send(chat_id, "Tidak ditemukan. Coba nama lebih sederhana atau sertakan pack (mis. 100g / 250g / Box).")
+                return {"ok": True}
+            lines = [f"• {r['name']} — {r['pack']}: {rupiah(r['price'])}" for r in rows]
+            await send(chat_id, "\n".join(lines))
+            return {"ok": True}
+
+        # Help
+        await send(chat_id,
+            "Perintah:\n"
+            "/ping\n"
+            "/harga <nama> [pack <teks>]\n"
+            "/produk [kata] [kategori <nama/kutip>] [page <N>]\n"
+            "/vaksin [kata] [page <N>]\n"
+            "Contoh: /produk vita kategori Peternakan page 2\n"
+            "Contoh kategori dengan spasi: /produk kategori \"Alat Kesehatan\""
+        )
         return {"ok": True}
 
-    # Help
-    await send(chat_id,
-        "Perintah:\n"
-        "/harga <nama> [pack <teks>]\n"
-        "/produk [kata] [kategori X] [page N]\n"
-        "/vaksin [kata] [page N]\n"
-        "Contoh: /produk vita kategori Peternakan page 2"
-    )
-    return {"ok": True}
+    except Exception as e:
+        # Never fail silently
+        print("Webhook handler error:", e)
+        try:
+            chat_id = update.get("message", {}).get("chat", {}).get("id")
+            if chat_id:
+                await send(chat_id, "Terjadi kesalahan. Coba lagi sebentar.")
+        except Exception:
+            pass
+        return {"ok": True}
